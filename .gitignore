@@ -1,0 +1,36 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go toolchain
+.cache/
+
+# Go module cache
+.go/
+
+# Go build cache
+.gocache/
+
+# External dependencies
+vendor/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System files
+.DS_Store
+thumbs.db
+
+# Gemini-specific files
+GEMINI.md
+
+var/
