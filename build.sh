@@ -45,7 +45,7 @@ for platform in "${PLATFORMS[@]}"; do
 
     # Build the command
     # -ldflags="-X main.Version=$VERSION" injects the version number into the binary
-    GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-X main.Version=$VERSION" -o "$DIST_DIR/$OUTPUT_NAME" .
+    GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-X main.version=$VERSION" -o "$DIST_DIR/$OUTPUT_NAME" ./cmd/valve
 done
 
 echo "Build complete. Binaries are in the '$DIST_DIR' directory."
