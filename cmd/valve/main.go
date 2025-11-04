@@ -17,6 +17,7 @@ var (
 	maxBuffer   int
 	onFull      string
 	showVersion bool
+	version     = "dev" // Default version, overridden by ldflags
 )
 
 var exitFunc = os.Exit
@@ -35,7 +36,7 @@ func main() {
 	pflag.Parse()
 
 	if showVersion {
-		fmt.Println("valve version 0.1.0") // Placeholder version
+		fmt.Printf("valve version %s\n", version)
 		exitFunc(0)
 	}
 

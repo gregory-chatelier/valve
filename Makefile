@@ -7,6 +7,12 @@ GOTEST=$(GOCMD) test
 GOFMT=$(GOCMD) fmt
 GOVET=$(GOCMD) vet
 
+# Get the latest git tag for the version
+VERSION ?= $(shell git describe --tags --abbrev=0)
+
+# Use ldflags to set the version at build time
+LDFLAGS = -ldflags="-X main.version=$(VERSION)"
+
 # Linting
 GOLANGCILINT=golangci-lint
 
@@ -19,7 +25,7 @@ all: build
 
 # Build the binary for the current platform
 build: 
-	$(GOBUILD) -o $(BINARY_NAME) .
+	$(GOBUILD) $(LDFLAGS) -o $(BINARY_NAME) .
 
 # Run all tests
 test: 
