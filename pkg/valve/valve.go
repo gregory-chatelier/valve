@@ -14,7 +14,6 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-
 // Strategy defines the behavior when the buffer is full.
 type Strategy string
 
@@ -29,18 +28,18 @@ const (
 
 // Valve controls the rate of data flow.
 type Valve struct {
-	limiter    *rate.Limiter
-	burst      int
-	jitter     time.Duration
-	progress   bool
-	maxBuffer  int
-	OnFull     Strategy
-	isBytes    bool
-	rate       float64
+	limiter   *rate.Limiter
+	burst     int
+	jitter    time.Duration
+	progress  bool
+	maxBuffer int
+	OnFull    Strategy
+	isBytes   bool
+	rate      float64
 
-	reader io.Reader
-	writer io.Writer
-	buffer chan []byte
+	reader         io.Reader
+	writer         io.Writer
+	buffer         chan []byte
 	progressWriter io.Writer
 
 	itemsProcessed int64
@@ -53,7 +52,6 @@ func (v *Valve) SetProgressWriter(w io.Writer) {
 	v.progressWriter = w
 }
 
-
 // New creates a new Valve with the given configuration.
 func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer int, onFull Strategy, isBytes bool, reader io.Reader, writer io.Writer) *Valve {
 	limiter := rate.NewLimiter(rate.Limit(rateVal), burst)
@@ -64,18 +62,18 @@ func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer
 	}
 
 	return &Valve{
-		limiter:    limiter,
-		burst:      burst,
-		jitter:     jitter,
-		progress:   progress,
-		maxBuffer:  maxBuffer,
-		OnFull:     onFull,
-		isBytes:    isBytes,
-		rate:       rateVal,
-		reader:     reader,
-		writer:     writer,
-		buffer:     make(chan []byte, maxBuffer),
-		startTime:  time.Now(),
+		limiter:   limiter,
+		burst:     burst,
+		jitter:    jitter,
+		progress:  progress,
+		maxBuffer: maxBuffer,
+		OnFull:    onFull,
+		isBytes:   isBytes,
+		rate:      rateVal,
+		reader:    reader,
+		writer:    writer,
+		buffer:    make(chan []byte, maxBuffer),
+		startTime: time.Now(),
 	}
 }
 func (v *Valve) Read() {
@@ -180,4 +178,3 @@ func (v *Valve) Write() {
 func (v *Valve) Buffer() chan []byte {
 	return v.buffer
 }
-

@@ -11,39 +11,39 @@ import (
 
 func TestValve_BufferingStrategies(t *testing.T) {
 	tests := []struct {
-		name        string
-		strategy    valve.Strategy
-		maxBuffer   int
-		input       []string
-		wantOutput  string
+		name       string
+		strategy   valve.Strategy
+		maxBuffer  int
+		input      []string
+		wantOutput string
 	}{
 		{
-			name:        "Block strategy - buffer not full",
-			strategy:    valve.Block,
-			maxBuffer:   3,
-			input:       []string{"a", "b", "c"},
-			wantOutput:  "a\nb\nc\n",
+			name:       "Block strategy - buffer not full",
+			strategy:   valve.Block,
+			maxBuffer:  3,
+			input:      []string{"a", "b", "c"},
+			wantOutput: "a\nb\nc\n",
 		},
 		{
-			name:        "Block strategy - buffer full",
-			strategy:    valve.Block,
-			maxBuffer:   2,
-			input:       []string{"a", "b", "c"}, // 'c' should block until 'a' is read
-			wantOutput:  "a\nb\nc\n",
+			name:       "Block strategy - buffer full",
+			strategy:   valve.Block,
+			maxBuffer:  2,
+			input:      []string{"a", "b", "c"}, // 'c' should block until 'a' is read
+			wantOutput: "a\nb\nc\n",
 		},
 		{
-			name:        "DropOldest strategy",
-			strategy:    valve.DropOldest,
-			maxBuffer:   2,
-			input:       []string{"a", "b", "c"}, // 'a' should be dropped, buffer contains [b, c]
-			wantOutput:  "b\nc\n",
+			name:       "DropOldest strategy",
+			strategy:   valve.DropOldest,
+			maxBuffer:  2,
+			input:      []string{"a", "b", "c"}, // 'a' should be dropped, buffer contains [b, c]
+			wantOutput: "b\nc\n",
 		},
 		{
-			name:        "DropNewest strategy",
-			strategy:    valve.DropNewest,
-			maxBuffer:   2,
-			input:       []string{"a", "b", "c"}, // 'c' should be dropped, buffer contains [a, b]
-			wantOutput:  "a\nb\n",
+			name:       "DropNewest strategy",
+			strategy:   valve.DropNewest,
+			maxBuffer:  2,
+			input:      []string{"a", "b", "c"}, // 'c' should be dropped, buffer contains [a, b]
+			wantOutput: "a\nb\n",
 		},
 	}
 
