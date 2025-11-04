@@ -10,9 +10,6 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 // Strategy defines the behavior when the buffer is full.
 type Strategy string
@@ -28,23 +25,24 @@ const (
 
 // Valve controls the rate of data flow.
 type Valve struct {
-	limiter   *rate.Limiter
-	burst     int
-	jitter    time.Duration
-	progress  bool
-	maxBuffer int
-	OnFull    Strategy
-	isBytes   bool
-	rate      float64
+	limiter    *rate.Limiter
+	burst      int
+	jitter     time.Duration
+	progress   bool
+	maxBuffer  int
+	OnFull     Strategy
+	isBytes    bool
+	rate       float64
 
-	reader         io.Reader
-	writer         io.Writer
-	buffer         chan []byte
+	reader io.Reader
+	writer io.Writer
+	buffer chan []byte
 	progressWriter io.Writer
 
 	itemsProcessed int64
 	bytesProcessed int64
 	startTime      time.Time
+	rng            *rand.Rand
 }
 
 // SetProgressWriter sets the writer for progress output.
@@ -74,6 +72,7 @@ func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer
 		writer:    writer,
 		buffer:    make(chan []byte, maxBuffer),
 		startTime: time.Now(),
+		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 func (v *Valve) Read() {
@@ -107,23 +106,18 @@ func (v *Valve) Read() {
 
 			switch v.OnFull {
 			case Block:
-				v.buffer <- dataCopy // This will block if the buffer is full
+				v.buffer <- dataCopy
 			case DropOldest:
 				select {
 				case v.buffer <- dataCopy:
-					// Successfully wrote to buffer
 				default:
-					// Buffer is full, drop oldest by reading one item and then writing new one
 					<-v.buffer
 					v.buffer <- dataCopy
 				}
 			case DropNewest:
 				select {
 				case v.buffer <- dataCopy:
-					// Successfully wrote to buffer
 				default:
-					// Buffer is full, drop newest (i.e., this dataCopy)
-					// Do nothing, effectively dropping dataCopy
 				}
 			}
 		}
@@ -135,7 +129,7 @@ func (v *Valve) Write() {
 		// Calculate jittered delay
 		delay := v.limiter.Reserve().Delay()
 		if v.jitter > 0 && delay > 0 {
-			randomFactor := 1.0 - (rand.Float64()*2-1)*(float64(v.jitter)/float64(time.Second))
+			randomFactor := 1.0 - (v.rng.Float64()*2-1)*(float64(v.jitter)/float64(time.Second))
 			delay = time.Duration(float64(delay) * randomFactor)
 		}
 
