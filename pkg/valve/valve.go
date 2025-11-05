@@ -142,50 +142,77 @@ func (v *Valve) Read() {
 }
 
 func (v *Valve) Write() {
-	for {
-		firstData, ok := <-v.buffer
-		if !ok {
-			return // Channel is closed and empty.
-		}
-
-		batch := [][]byte{firstData}
-		currentBatchBytes := len(firstData)
-
-		// Greedily pull more items from the buffer to fill the batch.
-	DrainLoop:
+	if v.isBytes {
+		// Byte-based transfers use adaptive batching for accuracy.
 		for {
-			// Determine if we should stop batching.
-			if v.isBytes {
+			firstData, ok := <-v.buffer
+			if !ok {
+				return // Channel is closed and empty.
+			}
+
+			batch := [][]byte{firstData}
+			currentBatchBytes := len(firstData)
+
+			// Greedily pull more items from the buffer to fill the batch.
+		DrainLoop:
+			for {
 				if currentBatchBytes >= v.targetBatchBytes {
 					break DrainLoop
 				}
-			} else {
-				if len(batch) >= v.burst {
-					break DrainLoop
+
+				select {
+				case data, ok := <-v.buffer:
+					if !ok {
+						break DrainLoop // Channel closed.
+					}
+					batch = append(batch, data)
+					currentBatchBytes += len(data)
+				default:
+					break DrainLoop // Buffer is empty.
 				}
 			}
 
-			select {
-			case data, ok := <-v.buffer:
-				if !ok {
-					break DrainLoop // Channel closed.
+			// Reserve tokens for the entire batch and sleep for the calculated delay.
+			if currentBatchBytes > 0 {
+				r := v.limiter.ReserveN(time.Now(), currentBatchBytes)
+				delay := r.Delay()
+
+				if v.jitter > 0 && delay > 0 {
+					randomFactor := 1.0 - (rand.Float64()*2-1)*(float64(v.jitter)/float64(time.Second))
+					delay = time.Duration(float64(delay) * randomFactor)
 				}
-				batch = append(batch, data)
-				currentBatchBytes += len(data)
-			default:
-				break DrainLoop // Buffer is empty.
+
+				if delay > 0 {
+					time.Sleep(delay)
+				}
+			}
+
+			// Write the entire batch to the output and update progress stats.
+			for _, data := range batch {
+				_, err := v.writer.Write(data)
+				if err != nil {
+					return // Or handle error
+				}
+			}
+
+			v.itemsProcessed += int64(len(batch))
+			v.bytesProcessed += int64(currentBatchBytes)
+
+			// Update progress display once per batch.
+			if v.progress && v.progressWriter != nil {
+				elapsed := time.Since(v.startTime).Seconds()
+				if elapsed > 0 {
+					bytesPerSecond := float64(v.bytesProcessed) / elapsed
+					progressInfo := fmt.Sprintf("\rTransferred: %s, Rate: %s/s", formatBytes(float64(v.bytesProcessed)), formatBytes(bytesPerSecond))
+					v.progressWriter.Write([]byte(progressInfo))
+				}
 			}
 		}
-
-		// Determine the size of the reservation for the rate limiter.
-		n := len(batch)
-		if v.isBytes {
-			n = currentBatchBytes
-		}
-
-		// Reserve tokens for the entire batch and sleep for the calculated delay.
-		if n > 0 {
-			r := v.limiter.ReserveN(time.Now(), n)
+	} else {
+		// Line-based transfers process one line at a time for classic token-bucket behavior.
+		for data := range v.buffer {
+			// Reserve 1 token for this line and sleep.
+			r := v.limiter.ReserveN(time.Now(), 1)
 			delay := r.Delay()
 
 			if v.jitter > 0 && delay > 0 {
@@ -196,39 +223,29 @@ func (v *Valve) Write() {
 			if delay > 0 {
 				time.Sleep(delay)
 			}
-		}
 
-		// Write the entire batch to the output and update progress stats.
-		for _, data := range batch {
+			// Write the single line to the output.
 			_, err := v.writer.Write(data)
 			if err != nil {
 				return // Or handle error
 			}
-			if !v.isBytes {
-				_, err = v.writer.Write([]byte("\n"))
-				if err != nil {
-					return // Or handle error
-				}
+			_, err = v.writer.Write([]byte("\n"))
+			if err != nil {
+				return // Or handle error
 			}
-		}
 
-		v.itemsProcessed += int64(len(batch))
-		v.bytesProcessed += int64(currentBatchBytes)
+			v.itemsProcessed++
+			v.bytesProcessed += int64(len(data))
 
-		// Update progress display once per batch.
-		if v.progress && v.progressWriter != nil {
-			elapsed := time.Since(v.startTime).Seconds()
-			if elapsed > 0 {
-				var progressInfo string
-				bytesPerSecond := float64(v.bytesProcessed) / elapsed
-
-				if v.isBytes {
-					progressInfo = fmt.Sprintf("\rTransferred: %s, Rate: %s/s", formatBytes(float64(v.bytesProcessed)), formatBytes(bytesPerSecond))
-				} else {
+			// Update progress display.
+			if v.progress && v.progressWriter != nil {
+				elapsed := time.Since(v.startTime).Seconds()
+				if elapsed > 0 {
+					bytesPerSecond := float64(v.bytesProcessed) / elapsed
 					linesPerSecond := float64(v.itemsProcessed) / elapsed
-					progressInfo = fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
+					progressInfo := fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
+					v.progressWriter.Write([]byte(progressInfo))
 				}
-				v.progressWriter.Write([]byte(progressInfo))
 			}
 		}
 	}
