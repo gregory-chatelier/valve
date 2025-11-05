@@ -129,7 +129,7 @@ func (v *Valve) Write() {
 		// Calculate jittered delay
 		delay := v.limiter.Reserve().Delay()
 		if v.jitter > 0 && delay > 0 {
-			randomFactor := 1.0 - (v.rng.Float64()*2-1)*(float64(v.jitter)/float64(time.Second))
+			randomFactor := 1.0 - (rand.Float64()*2-1)*(float64(v.jitter)/float64(time.Second))
 			delay = time.Duration(float64(delay) * randomFactor)
 		}
 
@@ -160,11 +160,18 @@ func (v *Valve) Write() {
 		// Write progress indicator
 		if v.progress && v.progressWriter != nil {
 			elapsed := time.Since(v.startTime).Seconds()
-			rate := float64(v.itemsProcessed) / elapsed
-			bytesPerSecond := float64(v.bytesProcessed) / elapsed
+			if elapsed > 0 {
+				var progressInfo string
+				bytesPerSecond := float64(v.bytesProcessed) / elapsed
 
-			progressInfo := fmt.Sprintf("\rProcessed: %d, Rate: %.2f/s, Data Rate: %.2f B/s", v.itemsProcessed, rate, bytesPerSecond)
-			v.progressWriter.Write([]byte(progressInfo))
+				if v.isBytes {
+					progressInfo = fmt.Sprintf("\rTransferred: %s, Rate: %s/s", formatBytes(float64(v.bytesProcessed)), formatBytes(bytesPerSecond))
+				} else {
+					linesPerSecond := float64(v.itemsProcessed) / elapsed
+					progressInfo = fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
+				}
+				v.progressWriter.Write([]byte(progressInfo))
+			}
 		}
 	}
 }
