@@ -25,23 +25,22 @@ const (
 
 // Valve controls the rate of data flow.
 type Valve struct {
-	limiter    *rate.Limiter
-	burst      int
-	jitter     time.Duration
-	progress   bool
-	maxBuffer  int
-	OnFull     Strategy
-	isBytes    bool
-	rate       float64
-
-	reader io.Reader
-	writer io.Writer
-	buffer chan []byte
-	progressWriter io.Writer
-
-	itemsProcessed int64
-	bytesProcessed int64
-	startTime      time.Time
+	limiter          *rate.Limiter
+	burst            int
+	jitter           time.Duration
+	progress         bool
+	maxBuffer        int
+	OnFull           Strategy
+	isBytes          bool
+	rate             float64
+	reader           io.Reader
+	writer           io.Writer
+	buffer           chan []byte
+	progressWriter   io.Writer
+	itemsProcessed   int64
+	bytesProcessed   int64
+	startTime        time.Time
+	targetBatchBytes int // For adaptive batching
 	rng            *rand.Rand
 }
 
@@ -52,7 +51,25 @@ func (v *Valve) SetProgressWriter(w io.Writer) {
 
 // New creates a new Valve with the given configuration.
 func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer int, onFull Strategy, isBytes bool, reader io.Reader, writer io.Writer) *Valve {
-	limiter := rate.NewLimiter(rate.Limit(rateVal), burst)
+	var targetBatchBytes int
+	limiterBurst := burst // Default for line-mode
+
+	if isBytes {
+		// For byte-mode, we use adaptive batching. Target ~50ms worth of data
+		// per batch for sleep accuracy.
+		targetBatchBytes = int(rateVal / 20.0)
+		if targetBatchBytes < 1024 {
+			targetBatchBytes = 1024
+		}
+
+		// The limiter's burst size MUST be at least the batch size. We add a margin
+		// of one chunk size because the batching loop may create a batch that is
+		// slightly larger than the target.
+		const assumedChunkSize = 1024
+		limiterBurst = targetBatchBytes + assumedChunkSize
+	}
+
+	limiter := rate.NewLimiter(rate.Limit(rateVal), limiterBurst)
 
 	jitter := time.Duration(0)
 	if jitterPercent > 0 {
@@ -60,19 +77,19 @@ func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer
 	}
 
 	return &Valve{
-		limiter:   limiter,
-		burst:     burst,
-		jitter:    jitter,
-		progress:  progress,
-		maxBuffer: maxBuffer,
-		OnFull:    onFull,
-		isBytes:   isBytes,
-		rate:      rateVal,
-		reader:    reader,
-		writer:    writer,
-		buffer:    make(chan []byte, maxBuffer),
-		startTime: time.Now(),
-		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		limiter:          limiter,
+		burst:            burst,
+		jitter:           jitter,
+		progress:         progress,
+		maxBuffer:        maxBuffer,
+		OnFull:           onFull,
+		isBytes:          isBytes,
+		rate:             rateVal,
+		reader:           reader,
+		writer:           writer,
+		buffer:           make(chan []byte, maxBuffer),
+		startTime:        time.Now(),
+		targetBatchBytes: targetBatchBytes,
 	}
 }
 func (v *Valve) Read() {
@@ -125,39 +142,80 @@ func (v *Valve) Read() {
 }
 
 func (v *Valve) Write() {
-	for data := range v.buffer {
-		// Calculate jittered delay
-		delay := v.limiter.Reserve().Delay()
-		if v.jitter > 0 && delay > 0 {
-			randomFactor := 1.0 - (rand.Float64()*2-1)*(float64(v.jitter)/float64(time.Second))
-			delay = time.Duration(float64(delay) * randomFactor)
+	for {
+		firstData, ok := <-v.buffer
+		if !ok {
+			return // Channel is closed and empty.
 		}
 
-		// Wait for the limiter
-		if delay > 0 {
-			time.Sleep(delay)
-		}
+		batch := [][]byte{firstData}
+		currentBatchBytes := len(firstData)
 
-		// Write the data
-		_, err := v.writer.Write(data)
-		if err != nil {
-			// Handle error
-			return
-		}
+		// Greedily pull more items from the buffer to fill the batch.
+	DrainLoop:
+		for {
+			// Determine if we should stop batching.
+			if v.isBytes {
+				if currentBatchBytes >= v.targetBatchBytes {
+					break DrainLoop
+				}
+			} else {
+				if len(batch) >= v.burst {
+					break DrainLoop
+				}
+			}
 
-		// Write a newline if not in bytes mode
-		if !v.isBytes {
-			_, err = v.writer.Write([]byte("\n"))
-			if err != nil {
-				// Handle error
-				return
+			select {
+			case data, ok := <-v.buffer:
+				if !ok {
+					break DrainLoop // Channel closed.
+				}
+				batch = append(batch, data)
+				currentBatchBytes += len(data)
+			default:
+				break DrainLoop // Buffer is empty.
 			}
 		}
 
-		v.itemsProcessed++
-		v.bytesProcessed += int64(len(data))
+		// Determine the size of the reservation for the rate limiter.
+		n := len(batch)
+		if v.isBytes {
+			n = currentBatchBytes
+		}
 
-		// Write progress indicator
+		// Reserve tokens for the entire batch and sleep for the calculated delay.
+		if n > 0 {
+			r := v.limiter.ReserveN(time.Now(), n)
+			delay := r.Delay()
+
+			if v.jitter > 0 && delay > 0 {
+				randomFactor := 1.0 - (rand.Float64()*2-1)*(float64(v.jitter)/float64(time.Second))
+				delay = time.Duration(float64(delay) * randomFactor)
+			}
+
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+		}
+
+		// Write the entire batch to the output and update progress stats.
+		for _, data := range batch {
+			_, err := v.writer.Write(data)
+			if err != nil {
+				return // Or handle error
+			}
+			if !v.isBytes {
+				_, err = v.writer.Write([]byte("\n"))
+				if err != nil {
+					return // Or handle error
+				}
+			}
+		}
+
+		v.itemsProcessed += int64(len(batch))
+		v.bytesProcessed += int64(currentBatchBytes)
+
+		// Update progress display once per batch.
 		if v.progress && v.progressWriter != nil {
 			elapsed := time.Since(v.startTime).Seconds()
 			if elapsed > 0 {
@@ -175,7 +233,6 @@ func (v *Valve) Write() {
 		}
 	}
 }
-
 func (v *Valve) Buffer() chan []byte {
 	return v.buffer
 }

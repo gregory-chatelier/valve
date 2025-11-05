@@ -24,7 +24,7 @@ var exitFunc = os.Exit
 
 func init() {
 	pflag.StringVarP(&rateStr, "rate", "r", "", "Flow rate (e.g., 10/s, 200/mn, 5MB/s, 2GB/h)")
-	pflag.IntVarP(&burst, "burst", "b", 1, "Burst size before pacing resumes (token bucket)")
+	pflag.IntVarP(&burst, "burst", "b", 1, "Burst size in lines (for line-based transfers)")
 	pflag.IntVarP(&jitter, "jitter", "j", 0, "Add \u00b1% random timing variation")
 	pflag.BoolVarP(&progress, "progress", "p", false, "Show progress bar and live rate")
 	pflag.IntVar(&maxBuffer, "max-buffer", 1024*1024, "Maximum internal buffer in bytes")
