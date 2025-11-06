@@ -95,7 +95,7 @@ done
 | `--jitter PERCENT` | Adds ±% random variation to timing (e.g., `--jitter 10`). |
 | `--progress` | Show a live progress indicator on `stderr`. |
 | `--max-buffer SIZE` | Maximum internal buffer size (e.g. `100MB`, `1GB`). Default: `1GB`. |
-| `--on-full STRATEGY` | What to do when the buffer is full: `block` (default), `drop-oldest`, `drop-newest`. |
+| `--on-full STRATEGY` | What to do when the buffer is full: `block` (default), `drop-newest`. |
 | `--version` | Print version info. |
 
 ### Advanced Features
@@ -104,7 +104,6 @@ done
 *   **`--jitter`**: Adds randomness to the pacing interval. This helps prevent the "thundering herd" problem in distributed systems where multiple processes might otherwise synchronize and create load spikes.
 *   **`--on-full`**: Defines the backpressure strategy.
     *   `block` (default): Pauses reading from `stdin` until the buffer has space. This is the safest, lossless option.
-    *   `drop-oldest`: When the buffer is full, the oldest items are discarded to make room for new ones. Good for when only the freshest data matters.
     *   `drop-newest`: When the buffer is full, new incoming items are ignored. Good for preserving a backlog of historical data.
 
 ## License

@@ -11,8 +11,6 @@ func ParseStrategy(s string) (Strategy, error) {
 	switch s {
 	case "block":
 		return Block, nil
-	case "drop-oldest":
-		return DropOldest, nil
 	case "drop-newest":
 		return DropNewest, nil
 	default:

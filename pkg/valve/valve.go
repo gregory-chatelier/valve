@@ -22,12 +22,8 @@ var bytePool = sync.Pool{
 type Strategy string
 
 const (
-	// Block strategy pauses reads until space frees up in the buffer.
-	Block Strategy = "block"
-	// DropOldest strategy discards the oldest data in the buffer to make space.
-	DropOldest Strategy = "drop-oldest"
-	// DropNewest strategy discards the newest incoming data when the buffer is full.
-	DropNewest Strategy = "drop-newest"
+	Block      Strategy = "block"       // Block when buffer is full
+	DropNewest Strategy = "drop-newest" // Drop the newest item when buffer is full
 )
 
 const (
@@ -92,7 +88,7 @@ func New(parentCtx context.Context, rateVal float64, burst int, jitterPercent in
 
 	// When a dropping strategy is used, or if the user wants no initial burst,
 	// we must consume the initial tokens from the bucket.
-	if onFull == DropOldest || onFull == DropNewest || burst <= 1 {
+	if onFull == DropNewest || burst <= 1 {
 		limiter.WaitN(ctx, limiterCapacity)
 	}
 
@@ -103,23 +99,23 @@ func New(parentCtx context.Context, rateVal float64, burst int, jitterPercent in
 	}
 
 	v := &Valve{
-		limiter:        limiter,
-		burst:          burst,
-		jitter:         time.Duration(0),
-		progress:       progress,
-		maxBuffer:      maxBuffer,
-		onFull:         onFull,
-		isBytes:        isBytes,
-		rate:           rateVal,
-		reader:         reader,
-		writer:         writer,
-		buffer:         make(chan []byte, maxBuffer),
-		sem:            sem,
-		startTime:      time.Now(),
-		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
-		ctx:            ctx,
-		cancel:         cancel,
-		errCh:          make(chan error, 1),
+		limiter:   limiter,
+		burst:     burst,
+		jitter:    time.Duration(0),
+		progress:  progress,
+		maxBuffer: maxBuffer,
+		onFull:    onFull,
+		isBytes:   isBytes,
+		rate:      rateVal,
+		reader:    reader,
+		writer:    writer,
+		buffer:    make(chan []byte, maxBuffer),
+		sem:       sem,
+		startTime: time.Now(),
+		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		ctx:       ctx,
+		cancel:    cancel,
+		errCh:     make(chan error, 1),
 	}
 	if jitterPercent > 0 && v.rate > 0 {
 		delayPerUnit := float64(time.Second) / v.rate
@@ -182,11 +178,6 @@ func (v *Valve) Read() {
 func (v *Valve) sendToBuffer(data []byte) {
 	switch v.onFull {
 	case Block:
-		<-v.sem
-		v.buffer <- data
-	case DropOldest:
-		// For DropOldest, the producer must wait for a slot to become free.
-		// The writer is responsible for dropping the oldest items.
 		<-v.sem
 		v.buffer <- data
 	case DropNewest:
@@ -258,7 +249,7 @@ func (v *Valve) Write() {
 			}
 		}
 	}
-}// Buffer is a convenience method for direct channel access in tests.
+} // Buffer is a convenience method for direct channel access in tests.
 func (v *Valve) Buffer() chan []byte {
 	return v.buffer
 }

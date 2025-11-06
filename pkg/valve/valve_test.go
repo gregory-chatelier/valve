@@ -40,14 +40,6 @@ func TestValve_BufferingStrategies(t *testing.T) {
 			rate:       2, // Slow rate to ensure buffer fills
 		},
 		{
-			name:       "DropOldest strategy (behaves as Block)",
-			strategy:   valve.DropOldest,
-			maxBuffer:  1,
-			input:      []string{"a", "b", "c"},
-			wantOutput: "a\nb\nc\n", // Expecting Block behavior
-			rate:       2,
-		},
-		{
 			name:       "DropNewest strategy",
 			strategy:   valve.DropNewest,
 			maxBuffer:  1,
@@ -264,13 +256,13 @@ func TestValve_RateLimiting(t *testing.T) {
 }
 
 func TestValve_DropNewest_RaceCondition(t *testing.T) {
-	output := &bytes.Buffer{}
+	out := &bytes.Buffer{}
 	input := "1\n2\n3\n4\n5\n"
 	reader := strings.NewReader(input)
 
 	// A buffer of size 2, with drop-newest strategy.
 	// Rate is 1 item/sec, burst is 1.
-	v := valve.New(context.Background(), 1, 1, 0, false, 2, valve.DropNewest, false, reader, output)
+	v := valve.New(context.Background(), 1, 1, 0, false, 2, valve.DropNewest, false, reader, out)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -283,7 +275,7 @@ func TestValve_DropNewest_RaceCondition(t *testing.T) {
 	// is full when it arrives. The old logic fails because the writer takes
 	// item "1" before sleeping, making space for item "3".
 	expected := "1\n2\n"
-	if got := output.String(); got != expected {
+	if got := out.String(); got != expected {
 		t.Errorf("DropNewest failed: got %q, want %q", got, expected)
 	}
 }

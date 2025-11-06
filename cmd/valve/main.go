@@ -29,7 +29,7 @@ func init() {
 	pflag.IntVarP(&jitter, "jitter", "j", 0, "Add \u00b1% random timing variation")
 	pflag.BoolVarP(&progress, "progress", "p", false, "Show progress bar and live rate")
 	pflag.IntVar(&maxBuffer, "max-buffer", 1024*1024, "Maximum internal buffer in bytes")
-	pflag.StringVar(&onFull, "on-full", "block", "On buffer full: block, drop-oldest, drop-newest")
+	pflag.StringVar(&onFull, "on-full", "block", "On buffer full: block, drop-newest")
 	pflag.BoolVar(&showVersion, "version", false, "Show version info")
 }
 
@@ -67,25 +67,25 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	        wg.Add(2)
-	
-	        go func() {
-	                defer wg.Done()
-	                v.Read()
-	        }()
-	
-	        go func() {
-	                defer wg.Done()
-	                v.Write()
-	        }()
-	
-	        // Goroutine to listen for errors from the Valve
-	        go func() {
-	                for err := range v.Err() {
-	                        fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-	                        exitFunc(1)
-	                }
-	        }()
-	
-	        wg.Wait()
-	}
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		v.Read()
+	}()
+
+	go func() {
+		defer wg.Done()
+		v.Write()
+	}()
+
+	// Goroutine to listen for errors from the Valve
+	go func() {
+		for err := range v.Err() {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			exitFunc(1)
+		}
+	}()
+
+	wg.Wait()
+}
