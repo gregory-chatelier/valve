@@ -2,6 +2,7 @@ package valve_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -61,7 +62,7 @@ func TestValve_BufferingStrategies(t *testing.T) {
 			outputWriter := &bytes.Buffer{}
 			inputReader := strings.NewReader(strings.Join(tt.input, "\n") + "\n")
 
-			v := valve.New(tt.rate, 1, 0, false, tt.maxBuffer, tt.strategy, false, inputReader, outputWriter)
+			v := valve.New(context.Background(), tt.rate, 1, 0, false, tt.maxBuffer, tt.strategy, false, inputReader, outputWriter)
 
 			var wg sync.WaitGroup
 			wg.Add(2)
@@ -95,7 +96,7 @@ func TestValve_ProgressIndicator(t *testing.T) {
 	maxBuffer := 10
 	numItems := 20
 
-	v := valve.New(rateVal, burst, 0, true, maxBuffer, valve.Block, false, inputReader, outputWriter)
+	v := valve.New(context.Background(), rateVal, burst, 0, true, maxBuffer, valve.Block, false, inputReader, outputWriter)
 	v.SetProgressWriter(progressWriter) // Assuming a SetProgressWriter method exists
 
 	var wg sync.WaitGroup
@@ -232,7 +233,7 @@ func TestValve_RateLimiting(t *testing.T) {
 			}
 
 			// Use io.Discard for the writer to avoid write overhead
-			v := valve.New(rate, 1, 0, false, 1024*1024, valve.Block, isBytes, reader, io.Discard)
+			v := valve.New(context.Background(), rate, 1, 0, false, 1024*1024, valve.Block, isBytes, reader, io.Discard)
 
 			var wg sync.WaitGroup
 			wg.Add(2)
@@ -269,7 +270,7 @@ func TestValve_DropNewest_RaceCondition(t *testing.T) {
 
 	// A buffer of size 2, with drop-newest strategy.
 	// Rate is 1 item/sec, burst is 1.
-	v := valve.New(1, 1, 0, false, 2, valve.DropNewest, false, reader, output)
+	v := valve.New(context.Background(), 1, 1, 0, false, 2, valve.DropNewest, false, reader, output)
 
 	var wg sync.WaitGroup
 	wg.Add(2)

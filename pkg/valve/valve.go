@@ -58,6 +58,9 @@ type Valve struct {
 	bytesProcessed int64
 	startTime      time.Time
 	rng            *rand.Rand // Random number generator for jitter
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // SetProgressWriter sets the writer for progress output.
@@ -66,7 +69,12 @@ func (v *Valve) SetProgressWriter(w io.Writer) {
 }
 
 // New creates a new Valve and starts its internal goroutines.
-func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer int, onFull Strategy, isBytes bool, reader io.Reader, writer io.Writer) *Valve {
+func New(parentCtx context.Context, rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer int, onFull Strategy, isBytes bool, reader io.Reader, writer io.Writer) *Valve {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parentCtx)
+
 	var limiterCapacity int
 	if isBytes {
 		adaptiveBatchSize := int(rateVal / adaptiveBatchTargetInterval)
@@ -84,7 +92,7 @@ func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer
 	// When a dropping strategy is used, or if the user wants no initial burst,
 	// we must consume the initial tokens from the bucket.
 	if onFull == DropOldest || onFull == DropNewest || burst <= 1 {
-		limiter.WaitN(context.Background(), limiterCapacity)
+		limiter.WaitN(ctx, limiterCapacity)
 	}
 
 	// The semaphore is filled with tokens representing the buffer capacity.
@@ -108,8 +116,9 @@ func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer
 		sem:            sem,
 		startTime:      time.Now(),
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
-
 	if jitterPercent > 0 && v.rate > 0 {
 		delayPerUnit := float64(time.Second) / v.rate
 		v.jitter = time.Duration(delayPerUnit * (float64(jitterPercent) / jitterPercentageDivisor))
@@ -124,6 +133,12 @@ func (v *Valve) Read() {
 
 	if v.isBytes {
 		for {
+			select {
+			case <-v.ctx.Done():
+				return
+			default:
+				// Continue reading
+			}
 			buf := bytePool.Get().([]byte)
 			n, err := v.reader.Read(buf)
 			if err != nil {
@@ -142,6 +157,12 @@ func (v *Valve) Read() {
 	} else {
 		scanner := bufio.NewScanner(v.reader)
 		for scanner.Scan() {
+			select {
+			case <-v.ctx.Done():
+				return
+			default:
+				// Continue reading
+			}
 			data := scanner.Bytes()
 			dataCopy := make([]byte, len(data)+1) // +1 for newline
 			copy(dataCopy, data)
@@ -174,55 +195,68 @@ func (v *Valve) sendToBuffer(data []byte) {
 
 // Write drains the buffer and writes to the final writer.
 func (v *Valve) Write() {
-	for data := range v.buffer {
-		// Rate limit first.
-		n := 1
-		if v.isBytes {
-			n = len(data)
-		}
-		reservation := v.limiter.ReserveN(time.Now(), n)
-		delay := reservation.Delay()
-
-		if v.jitter > 0 {
-			randomJitter := time.Duration(v.rng.Int63n(int64(v.jitter*2))) - v.jitter // Random value between -v.jitter and +v.jitter
-			delay += randomJitter
-			if delay < 0 {
-				delay = 0
-			}
-		}
-
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-
-		// Now write.
-		_, err := v.writer.Write(data)
-		if err != nil {
+	for {
+		select {
+		case <-v.ctx.Done():
 			return
-		}
+		case data, ok := <-v.buffer:
+			if !ok {
+				return // Channel closed
+			}
+			// Rate limit first.
+			n := 1
+			if v.isBytes {
+				n = len(data)
+			}
+			reservation := v.limiter.ReserveN(time.Now(), n)
+			delay := reservation.Delay()
 
-		// Only after the write is complete, release the semaphore token.
-		v.sem <- struct{}{}
-
-		// Update progress stats.
-		v.itemsProcessed++
-		v.bytesProcessed += int64(len(data))
-		if v.progress && v.progressWriter != nil {
-			elapsed := time.Since(v.startTime).Seconds()
-			if elapsed > 0 {
-				var progressInfo string
-				bytesPerSecond := float64(v.bytesProcessed) / elapsed
-				if v.isBytes {
-					progressInfo = fmt.Sprintf("\rTransferred: %s, Rate: %s/s", formatBytes(float64(v.bytesProcessed)), formatBytes(bytesPerSecond))
-				} else {
-					linesPerSecond := float64(v.itemsProcessed) / elapsed
-					progressInfo = fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
+			if v.jitter > 0 {
+				randomJitter := time.Duration(v.rng.Int63n(int64(v.jitter*2))) - v.jitter // Random value between -v.jitter and +v.jitter
+				delay += randomJitter
+				if delay < 0 {
+					delay = 0
 				}
-				v.progressWriter.Write([]byte(progressInfo))
+			}
+
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+
+			// Now write.
+			_, err := v.writer.Write(data)
+			if err != nil {
+				return
+			}
+
+			// Only after the write is complete, release the semaphore token.
+			v.sem <- struct{}{}
+
+			// Update progress stats.
+			v.itemsProcessed++
+			v.bytesProcessed += int64(len(data))
+			if v.progress && v.progressWriter != nil {
+				elapsed := time.Since(v.startTime).Seconds()
+				if elapsed > 0 {
+					var progressInfo string
+					bytesPerSecond := float64(v.bytesProcessed) / elapsed
+					if v.isBytes {
+						progressInfo = fmt.Sprintf("\rTransferred: %s, Rate: %s/s", formatBytes(float64(v.bytesProcessed)), formatBytes(bytesPerSecond))
+					} else {
+						linesPerSecond := float64(v.itemsProcessed) / elapsed
+						progressInfo = fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
+					}
+					v.progressWriter.Write([]byte(progressInfo))
+				}
 			}
 		}
 	}
 }// Buffer is a convenience method for direct channel access in tests.
 func (v *Valve) Buffer() chan []byte {
 	return v.buffer
+}
+
+// Close cancels the internal context, signaling all goroutines to shut down.
+func (v *Valve) Close() {
+	v.cancel()
 }

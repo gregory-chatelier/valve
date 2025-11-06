@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -58,7 +59,8 @@ func main() {
 		exitFunc(1)
 	}
 
-	v := valve.New(rate, burst, jitter, progress, maxBuffer, strategy, isBytes, os.Stdin, os.Stdout)
+	v := valve.New(context.Background(), rate, burst, jitter, progress, maxBuffer, strategy, isBytes, os.Stdin, os.Stdout)
+	defer v.Close() // Ensure context is cancelled and goroutines are cleaned up
 
 	if progress {
 		v.SetProgressWriter(os.Stderr)
