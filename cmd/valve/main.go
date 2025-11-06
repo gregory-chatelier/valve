@@ -67,17 +67,25 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		v.Read()
-	}()
-
-	go func() {
-		defer wg.Done()
-		v.Write()
-	}()
-
-	wg.Wait()
-}
+	        wg.Add(2)
+	
+	        go func() {
+	                defer wg.Done()
+	                v.Read()
+	        }()
+	
+	        go func() {
+	                defer wg.Done()
+	                v.Write()
+	        }()
+	
+	        // Goroutine to listen for errors from the Valve
+	        go func() {
+	                for err := range v.Err() {
+	                        fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	                        exitFunc(1)
+	                }
+	        }()
+	
+	        wg.Wait()
+	}

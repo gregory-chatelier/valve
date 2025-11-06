@@ -61,6 +61,7 @@ type Valve struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	errCh  chan error // Channel to expose errors
 }
 
 // SetProgressWriter sets the writer for progress output.
@@ -118,6 +119,7 @@ func New(parentCtx context.Context, rateVal float64, burst int, jitterPercent in
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
 		ctx:            ctx,
 		cancel:         cancel,
+		errCh:          make(chan error, 1),
 	}
 	if jitterPercent > 0 && v.rate > 0 {
 		delayPerUnit := float64(time.Second) / v.rate
@@ -147,6 +149,7 @@ func (v *Valve) Read() {
 					break
 				}
 				bytePool.Put(buf)
+				v.errCh <- err // Send error to channel
 				return
 			}
 			dataCopy := make([]byte, n)
@@ -168,6 +171,9 @@ func (v *Valve) Read() {
 			copy(dataCopy, data)
 			dataCopy[len(data)] = '\n'
 			v.sendToBuffer(dataCopy)
+		}
+		if err := scanner.Err(); err != nil {
+			v.errCh <- err // Send scanner error to channel
 		}
 	}
 }
@@ -226,6 +232,7 @@ func (v *Valve) Write() {
 			// Now write.
 			_, err := v.writer.Write(data)
 			if err != nil {
+				v.errCh <- err // Send error to channel
 				return
 			}
 
@@ -259,4 +266,9 @@ func (v *Valve) Buffer() chan []byte {
 // Close cancels the internal context, signaling all goroutines to shut down.
 func (v *Valve) Close() {
 	v.cancel()
+}
+
+// Err returns the error channel for the Valve.
+func (v *Valve) Err() <-chan error {
+	return v.errCh
 }
