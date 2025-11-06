@@ -6,10 +6,17 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
 )
+
+var bytePool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 1024) // Default buffer size
+	},
+}
 
 // Strategy defines the behavior when the buffer is full.
 type Strategy string
@@ -23,6 +30,12 @@ const (
 	DropNewest Strategy = "drop-newest"
 )
 
+const (
+	defaultChunkSize            = 1024
+	adaptiveBatchTargetInterval = 20.0 // Target ~50ms (1/20th of a second) for adaptive batching
+	jitterPercentageDivisor     = 100.0
+)
+
 // Valve controls the rate of data flow.
 type Valve struct {
 	limiter        *rate.Limiter
@@ -30,7 +43,7 @@ type Valve struct {
 	jitter         time.Duration
 	progress       bool
 	maxBuffer      int
-	OnFull         Strategy
+	onFull         Strategy // Unexported
 	isBytes        bool
 	rate           float64
 	reader         io.Reader
@@ -44,6 +57,7 @@ type Valve struct {
 	itemsProcessed int64
 	bytesProcessed int64
 	startTime      time.Time
+	rng            *rand.Rand // Random number generator for jitter
 }
 
 // SetProgressWriter sets the writer for progress output.
@@ -53,22 +67,24 @@ func (v *Valve) SetProgressWriter(w io.Writer) {
 
 // New creates a new Valve and starts its internal goroutines.
 func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer int, onFull Strategy, isBytes bool, reader io.Reader, writer io.Writer) *Valve {
-	limiterBurst := burst
+	var limiterCapacity int
 	if isBytes {
-		adaptiveBatchSize := int(rateVal / 20.0)
-		if adaptiveBatchSize < 1024 {
-			adaptiveBatchSize = 1024
+		adaptiveBatchSize := int(rateVal / adaptiveBatchTargetInterval)
+		if adaptiveBatchSize < defaultChunkSize {
+			adaptiveBatchSize = defaultChunkSize
 		}
-		const assumedChunkSize = 1024
-		limiterBurst = adaptiveBatchSize + assumedChunkSize
+		const assumedChunkSize = defaultChunkSize
+		limiterCapacity = adaptiveBatchSize + assumedChunkSize
+	} else {
+		limiterCapacity = burst
 	}
 
-	limiter := rate.NewLimiter(rate.Limit(rateVal), limiterBurst)
+	limiter := rate.NewLimiter(rate.Limit(rateVal), limiterCapacity)
 
 	// When a dropping strategy is used, or if the user wants no initial burst,
 	// we must consume the initial tokens from the bucket.
 	if onFull == DropOldest || onFull == DropNewest || burst <= 1 {
-		limiter.WaitN(context.Background(), limiterBurst)
+		limiter.WaitN(context.Background(), limiterCapacity)
 	}
 
 	// The semaphore is filled with tokens representing the buffer capacity.
@@ -83,7 +99,7 @@ func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer
 		jitter:         time.Duration(0),
 		progress:       progress,
 		maxBuffer:      maxBuffer,
-		OnFull:         onFull,
+		onFull:         onFull,
 		isBytes:        isBytes,
 		rate:           rateVal,
 		reader:         reader,
@@ -91,11 +107,12 @@ func New(rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer
 		buffer:         make(chan []byte, maxBuffer),
 		sem:            sem,
 		startTime:      time.Now(),
+		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 	if jitterPercent > 0 && v.rate > 0 {
 		delayPerUnit := float64(time.Second) / v.rate
-		v.jitter = time.Duration(delayPerUnit * (float64(jitterPercent) / 100.0))
+		v.jitter = time.Duration(delayPerUnit * (float64(jitterPercent) / jitterPercentageDivisor))
 	}
 
 	return v
@@ -106,24 +123,29 @@ func (v *Valve) Read() {
 	defer close(v.buffer)
 
 	if v.isBytes {
-		buf := make([]byte, 1024)
 		for {
+			buf := bytePool.Get().([]byte)
 			n, err := v.reader.Read(buf)
 			if err != nil {
 				if err == io.EOF {
+					bytePool.Put(buf)
 					break
 				}
+				bytePool.Put(buf)
 				return
 			}
 			dataCopy := make([]byte, n)
 			copy(dataCopy, buf[:n])
 			v.sendToBuffer(dataCopy)
+			bytePool.Put(buf)
 		}
 	} else {
 		scanner := bufio.NewScanner(v.reader)
 		for scanner.Scan() {
-			dataCopy := make([]byte, len(scanner.Bytes()))
-			copy(dataCopy, scanner.Bytes())
+			data := scanner.Bytes()
+			dataCopy := make([]byte, len(data)+1) // +1 for newline
+			copy(dataCopy, data)
+			dataCopy[len(data)] = '\n'
 			v.sendToBuffer(dataCopy)
 		}
 	}
@@ -131,7 +153,7 @@ func (v *Valve) Read() {
 
 // sendToBuffer acquires a semaphore token before adding data to the buffer.
 func (v *Valve) sendToBuffer(data []byte) {
-	switch v.OnFull {
+	switch v.onFull {
 	case Block:
 		<-v.sem
 		v.buffer <- data
@@ -158,25 +180,25 @@ func (v *Valve) Write() {
 		if v.isBytes {
 			n = len(data)
 		}
-		err := v.limiter.WaitN(context.Background(), n)
-		if err != nil {
-			return
-		}
+		reservation := v.limiter.ReserveN(time.Now(), n)
+		delay := reservation.Delay()
 
 		if v.jitter > 0 {
-			jitterAmount := time.Duration(rand.Int63n(int64(v.jitter)*2)) - v.jitter
-			time.Sleep(jitterAmount)
+			randomJitter := time.Duration(v.rng.Int63n(int64(v.jitter*2))) - v.jitter // Random value between -v.jitter and +v.jitter
+			delay += randomJitter
+			if delay < 0 {
+				delay = 0
+			}
 		}
 
-		_, err = v.writer.Write(data)
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		// Now write.
+		_, err := v.writer.Write(data)
 		if err != nil {
 			return
-		}
-		if !v.isBytes {
-			_, err = v.writer.Write([]byte("\n"))
-			if err != nil {
-				return
-			}
 		}
 
 		// Only after the write is complete, release the semaphore token.
@@ -196,13 +218,11 @@ func (v *Valve) Write() {
 					linesPerSecond := float64(v.itemsProcessed) / elapsed
 					progressInfo = fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
 				}
-			v.progressWriter.Write([]byte(progressInfo))
+				v.progressWriter.Write([]byte(progressInfo))
 			}
 		}
 	}
-}
-
-// Buffer is a convenience method for direct channel access in tests.
+}// Buffer is a convenience method for direct channel access in tests.
 func (v *Valve) Buffer() chan []byte {
 	return v.buffer
 }
