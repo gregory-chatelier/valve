@@ -13,7 +13,7 @@ echo "
 --- 1. Limiting output to 1 line/sec with a burst for 5 lines ---"
 (for i in $(seq 1 10); do echo "Line $i"; sleep 0.1; done) | $VALVE --rate 1/s --burst 5
 
---- Demo 2: Byte-Based Rate Limiting with Progress ---
+# --- Demo 2: Byte-Based Rate Limiting with Progress ---
 echo "
 --- 2. Limiting data transfer to 5MB/s with a progress bar ---"
 echo "Creating a 10MB dummy file..."
