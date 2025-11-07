@@ -15,7 +15,7 @@ var (
 	burst       int
 	jitter      int
 	progress    bool
-	maxBuffer   int
+	maxBuffer   string
 	onFull      string
 	showVersion bool
 	version     = "dev" // Default version, overridden by ldflags
@@ -28,7 +28,7 @@ func init() {
 	pflag.IntVarP(&burst, "burst", "b", 1, "Burst size in lines (for line-based transfers)")
 	pflag.IntVarP(&jitter, "jitter", "j", 0, "Add \u00b1% random timing variation")
 	pflag.BoolVarP(&progress, "progress", "p", false, "Show progress bar and live rate")
-	pflag.IntVar(&maxBuffer, "max-buffer", 1024*1024, "Maximum internal buffer in bytes")
+	pflag.StringVar(&maxBuffer, "max-buffer", "128KB", "Maximum internal buffer size (e.g., 64KB, 128KB, 512KB)")
 	pflag.StringVar(&onFull, "on-full", "block", "On buffer full: block, drop-newest")
 	pflag.BoolVar(&showVersion, "version", false, "Show version info")
 }
@@ -53,13 +53,20 @@ func main() {
 		exitFunc(1)
 	}
 
+	var bufferSize int
+	bufferSize, err = valve.ParseByteSize(maxBuffer)
+	if err != nil {
+		fmt.Printf("Error parsing buffer size: %v\n", err)
+		exitFunc(1)
+	}
+
 	strategy, err := valve.ParseStrategy(onFull)
 	if err != nil {
 		fmt.Printf("Error parsing strategy: %v\n", err)
 		exitFunc(1)
 	}
 
-	v := valve.New(context.Background(), rate, burst, jitter, progress, maxBuffer, strategy, isBytes, os.Stdin, os.Stdout)
+	v := valve.New(context.Background(), rate, burst, jitter, progress, bufferSize, strategy, isBytes, os.Stdin, os.Stdout)
 	defer v.Close() // Ensure context is cancelled and goroutines are cleaned up
 
 	if progress {

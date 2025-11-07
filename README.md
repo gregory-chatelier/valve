@@ -94,7 +94,7 @@ done
 | `--burst COUNT` | Number of items to allow in an initial burst. Default: `1`. |
 | `--jitter PERCENT` | Adds ±% random variation to timing (e.g., `--jitter 10`). |
 | `--progress` | Show a live progress indicator on `stderr`. |
-| `--max-buffer SIZE` | Maximum internal buffer size (e.g. `100MB`, `1GB`). Default: `1GB`. |
+| `--max-buffer SIZE` | Maximum internal buffer size (e.g., `64KB`, `128KB`, `512KB`). Default: `128KB`. Maximum allowed: `5MB`. |
 | `--on-full STRATEGY` | What to do when the buffer is full: `block` (default), `drop-newest`. |
 | `--version` | Print version info. |
 
