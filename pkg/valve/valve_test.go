@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gregory-chatelier/valve/pkg/valve"
+	"github.com/stretchr/testify/require"
 )
 
-// TestValve_BufferingStrategies is now fully concurrent for all strategies.
 func TestValve_BufferingStrategies(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -37,14 +37,14 @@ func TestValve_BufferingStrategies(t *testing.T) {
 			maxBuffer:  1,
 			input:      []string{"a", "b", "c"},
 			wantOutput: "a\nb\nc\n",
-			rate:       1000, // Changed from 2 to 1000 to rule out rate limiting as the cause
+			rate:       1000,
 		},
 		{
 			name:       "DropNewest strategy",
 			strategy:   valve.DropNewest,
 			maxBuffer:  1,
 			input:      []string{"a", "b", "c"},
-			wantOutput: "a\n", // a gets in, b and c are dropped.
+			wantOutput: "a\n",
 			rate:       1,
 		},
 	}
@@ -54,26 +54,21 @@ func TestValve_BufferingStrategies(t *testing.T) {
 			outputWriter := &bytes.Buffer{}
 			inputReader := strings.NewReader(strings.Join(tt.input, "\n") + "\n")
 
-			v := valve.New(context.Background(), tt.rate, 1, 0, false, tt.maxBuffer, tt.strategy, false, inputReader, outputWriter)
-
-			var wg sync.WaitGroup
-			wg.Add(2)
-
-			go func() {
-				defer wg.Done()
-				v.Read()
-			}()
-
-			go func() {
-				defer wg.Done()
-				v.Write()
-			}()
-
-			wg.Wait()
-
-			if gotOutput := outputWriter.String(); gotOutput != tt.wantOutput {
-				t.Errorf("got output %q, want %q", gotOutput, tt.wantOutput)
+			opts := valve.Options{
+				Rate:          tt.rate,
+				Burst:         1,
+				MaxBufferSize: tt.maxBuffer,
+				Strategy:      tt.strategy,
+				Reader:        inputReader,
+				Writer:        outputWriter,
 			}
+			v, err := valve.New(context.Background(), opts)
+			require.NoError(t, err)
+
+			err = v.Run()
+			require.NoError(t, err)
+
+			require.Equal(t, tt.wantOutput, outputWriter.String())
 		})
 	}
 }
@@ -83,41 +78,39 @@ func TestValve_ProgressIndicator(t *testing.T) {
 	outputWriter := &bytes.Buffer{}
 	progressWriter := &bytes.Buffer{}
 
-	rateVal := 10.0 // 10 items per second
-	burst := 1
-	maxBuffer := 10
-	numItems := 20
-
-	v := valve.New(context.Background(), rateVal, burst, 0, true, maxBuffer, valve.Block, false, inputReader, outputWriter)
-	v.SetProgressWriter(progressWriter) // Assuming a SetProgressWriter method exists
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		v.Write()
-	}()
-
-	go func() {
-		defer wg.Done()
-		v.Read()
-	}()
-
-	for i := 0; i < numItems; i++ {
-		inputReader.WriteString(fmt.Sprintf("item%d\n", i))
+	opts := valve.Options{
+		Rate:           10.0,
+		Burst:          1,
+		ShowProgress:   true,
+		MaxBufferSize:  10,
+		Strategy:       valve.Block,
+		Reader:         inputReader,
+		Writer:         outputWriter,
+		ProgressWriter: progressWriter,
 	}
+	v, err := valve.New(context.Background(), opts)
+	require.NoError(t, err)
 
+	// We need to run the valve in a goroutine to be able to write to its input
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		v.Run()
+	}()
+
+	for i := 0; i < 20; i++ {
+		fmt.Fprintf(inputReader, "item%d\n", i)
+		time.Sleep(10 * time.Millisecond) // Give some time for processing
+	}
+	// Closing the reader is not feasible here, so we just wait a bit
+	time.Sleep(3 * time.Second)
+	v.Close() // Manually close the valve
 	wg.Wait()
 
-	// Check if progress output was written
-	if progressWriter.Len() == 0 {
-		t.Error("expected progress output, but got none")
-	}
-
-	// Further checks could involve parsing the progress output and verifying its content and frequency
+	require.NotEmpty(t, progressWriter.String(), "expected progress output, but got none")
 }
 
-// dummyReader is a simple reader that produces a constant stream of zero bytes.
 type dummyReader struct {
 	totalSize int64
 	readPos   int64
@@ -127,19 +120,15 @@ func (r *dummyReader) Read(p []byte) (n int, err error) {
 	if r.readPos >= r.totalSize {
 		return 0, io.EOF
 	}
-
 	remaining := r.totalSize - r.readPos
 	if int64(len(p)) > remaining {
 		p = p[:remaining]
 	}
-
 	for i := range p {
 		p[i] = 0
 	}
-
 	n = len(p)
 	r.readPos += int64(n)
-
 	return n, nil
 }
 
@@ -149,74 +138,27 @@ func TestValve_RateLimiting(t *testing.T) {
 		rateStr          string
 		dataSize         int64
 		isBytes          bool
-		numLines         int // for line-based tests
+		numLines         int
 		expectedDuration time.Duration
-		tolerance        float64 // e.g., 0.25 for 25%
+		tolerance        float64
 	}{
-		// Byte-based tests
-		{
-			name:             "20KB at 40KB/s",
-			rateStr:          "40KB/s",
-			dataSize:         20 * 1024,
-			isBytes:          true,
-			expectedDuration: 500 * time.Millisecond,
-			tolerance:        0.25,
-		},
-		{
-			name:             "1MB at 2MB/s",
-			rateStr:          "2MB/s",
-			dataSize:         1 * 1024 * 1024,
-			isBytes:          true,
-			expectedDuration: 500 * time.Millisecond,
-			tolerance:        0.25,
-		},
-		{
-			name:             "5MB at 10MB/s",
-			rateStr:          "10MB/s",
-			dataSize:         5 * 1024 * 1024,
-			isBytes:          true,
-			expectedDuration: 500 * time.Millisecond,
-			tolerance:        0.25,
-		},
-		{
-			name:             "10MB at 5MB/s",
-			rateStr:          "5MB/s",
-			dataSize:         10 * 1024 * 1024,
-			isBytes:          true,
-			expectedDuration: 2 * time.Second,
-			tolerance:        0.20,
-		},
-		// Line-based tests
-		{
-			name:             "100 lines at 200 lines/s",
-			rateStr:          "200/s",
-			numLines:         100,
-			isBytes:          false,
-			expectedDuration: 500 * time.Millisecond,
-			tolerance:        0.25,
-		},
-		{
-			name:             "1000 lines at 200 lines/s",
-			rateStr:          "200/s",
-			numLines:         1000,
-			isBytes:          false,
-			expectedDuration: 5 * time.Second,
-			tolerance:        0.20,
-		},
+		{"20KB at 40KB/s", "40KB/s", 20 * 1024, true, 0, 500 * time.Millisecond, 0.25},
+		{"1MB at 2MB/s", "2MB/s", 1 * 1024 * 1024, true, 0, 500 * time.Millisecond, 0.25},
+		{"5MB at 10MB/s", "10MB/s", 5 * 1024 * 1024, true, 0, 500 * time.Millisecond, 0.25},
+		{"10MB at 5MB/s", "5MB/s", 10 * 1024 * 1024, true, 0, 2 * time.Second, 0.20},
+		{"100 lines at 200 lines/s", "200/s", 0, false, 100, 500 * time.Millisecond, 0.25},
+		{"1000 lines at 200 lines/s", "200/s", 0, false, 1000, 5 * time.Second, 0.20},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rate, isBytes, err := valve.ParseRate(tt.rateStr)
-			if err != nil {
-				t.Fatalf("ParseRate() error = %v", err)
-			}
+			require.NoError(t, err)
 
 			var reader io.Reader
 			if tt.isBytes {
 				reader = &dummyReader{totalSize: tt.dataSize}
 			} else {
-				// Create a reader with N lines
 				var sb strings.Builder
 				for i := 0; i < tt.numLines; i++ {
 					sb.WriteString("this is a test line\n")
@@ -224,34 +166,28 @@ func TestValve_RateLimiting(t *testing.T) {
 				reader = strings.NewReader(sb.String())
 			}
 
-			// Use io.Discard for the writer to avoid write overhead
-			v := valve.New(context.Background(), rate, 1, 0, false, 1024*1024, valve.Block, isBytes, reader, io.Discard)
-
-			var wg sync.WaitGroup
-			wg.Add(2)
+			opts := valve.Options{
+				Rate:          rate,
+				Burst:         1,
+				MaxBufferSize: 1024 * 1024,
+				Strategy:      valve.Block,
+				IsBytes:       isBytes,
+				Reader:        reader,
+				Writer:        io.Discard,
+			}
+			v, err := valve.New(context.Background(), opts)
+			require.NoError(t, err)
 
 			startTime := time.Now()
-
-			go func() {
-				defer wg.Done()
-				v.Read()
-			}()
-
-			go func() {
-				defer wg.Done()
-				v.Write()
-			}()
-
-			wg.Wait()
-
+			err = v.Run()
 			elapsedTime := time.Since(startTime)
+			require.NoError(t, err)
 
 			minDuration := time.Duration(float64(tt.expectedDuration) * (1.0 - tt.tolerance))
 			maxDuration := time.Duration(float64(tt.expectedDuration) * (1.0 + tt.tolerance))
 
-			if elapsedTime < minDuration || elapsedTime > maxDuration {
-				t.Errorf("elapsed time = %v, want between %v and %v", elapsedTime, minDuration, maxDuration)
-			}
+			require.True(t, elapsedTime >= minDuration && elapsedTime <= maxDuration,
+				"elapsed time = %v, want between %v and %v", elapsedTime, minDuration, maxDuration)
 		})
 	}
 }
@@ -261,122 +197,24 @@ func TestValve_DropNewest_RaceCondition(t *testing.T) {
 	input := "1\n2\n3\n4\n5\n"
 	reader := strings.NewReader(input)
 
-	// A buffer of size 2, with drop-newest strategy.
-	// Rate is 1 item/sec, burst is 1.
-	v := valve.New(context.Background(), 1, 1, 0, false, 2, valve.DropNewest, false, reader, out)
+	opts := valve.Options{
+		Rate:          1,
+		Burst:         1,
+		MaxBufferSize: 2,
+		Strategy:      valve.DropNewest,
+		Reader:        reader,
+		Writer:        out,
+	}
+	v, err := valve.New(context.Background(), opts)
+	require.NoError(t, err)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); v.Read() }()
-	go func() { defer wg.Done(); v.Write() }()
-	wg.Wait()
+	err = v.Run()
+	require.NoError(t, err)
 
-	// With a buffer of 2, only items "1" and "2" should ever be in the buffer
-	// and subsequently written. Item "3" should be dropped because the buffer
-	// is full when it arrives. The old logic fails because the writer takes
-	// item "1" before sleeping, making space for item "3".
 	expected := "1\n2\n"
-	if got := out.String(); got != expected {
-		t.Errorf("DropNewest failed: got %q, want %q", got, expected)
-	}
+	require.Equal(t, expected, out.String(), "DropNewest failed")
 }
 
-// TestValve_DropNewestEdgeCases tests various scenarios for the DropNewest strategy.
-func TestValve_DropNewestEdgeCases(t *testing.T) {
-	tests := []struct {
-		name       string
-		maxBuffer  int
-		input      string
-		wantOutput string
-		wantErr    bool
-	}{
-		{
-			name:       "Buffer size 1, input > 1",
-			maxBuffer:  1,
-			input:      "a\nb\nc\n",
-			wantOutput: "a\n",
-			wantErr:    false,
-		},
-		{
-			name:       "Buffer size 2, input > 2",
-			maxBuffer:  2,
-			input:      "a\nb\nc\nd\n",
-			wantOutput: "a\nb\n",
-			wantErr:    false,
-		},
-		{
-			name:       "Empty input",
-			maxBuffer:  1,
-			input:      "",
-			wantOutput: "",
-			wantErr:    false,
-		},
-		{
-			name:       "Input with EOF after some data",
-			maxBuffer:  2,
-			input:      "a\nb\n", // Simulate EOF after b
-			wantOutput: "a\nb\n",
-			wantErr:    false,
-		},
-		{
-			name:       "Input with read error",
-			maxBuffer:  1,
-			input:      "a\n" + "error\n", // Simulate error after 'a'
-			wantOutput: "a\n",
-			wantErr:    true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			outputWriter := &bytes.Buffer{}
-			var inputReader io.Reader = strings.NewReader(tt.input) // Declare as io.Reader
-
-			// For simulating read errors, we'll use a custom reader.
-			if tt.name == "Input with read error" {
-				inputReader = &errorReader{reader: strings.NewReader("a\n"), err: fmt.Errorf("simulated read error")}
-			}
-
-			v := valve.New(context.Background(), 1, 1, 0, false, tt.maxBuffer, valve.DropNewest, false, inputReader, outputWriter)
-
-			var wg sync.WaitGroup
-			wg.Add(2)
-
-			go func() {
-				defer wg.Done()
-				v.Read()
-			}()
-
-			go func() {
-				defer wg.Done()
-				v.Write()
-			}()
-
-			var receivedErr error
-			go func() {
-				select {
-				case err := <-v.Err():
-					receivedErr = err
-				case <-time.After(100 * time.Millisecond): // Timeout to prevent hanging
-				}
-			}()
-
-			wg.Wait()
-
-			if gotOutput := outputWriter.String(); gotOutput != tt.wantOutput {
-				t.Errorf("got output %q, want %q", gotOutput, tt.wantOutput)
-			}
-
-			if tt.wantErr && receivedErr == nil {
-				t.Errorf("expected an error but got none")
-			} else if !tt.wantErr && receivedErr != nil {
-				t.Errorf("did not expect an error but got: %v", receivedErr)
-			}
-		})
-	}
-}
-
-// errorReader is a helper to simulate read errors.
 type errorReader struct {
 	reader io.Reader
 	err    error

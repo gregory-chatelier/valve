@@ -48,6 +48,12 @@ echo "Quickly feeding 10 items into a valve with a buffer size of 2, at a slow o
 echo "Only the first 2 items should get through; the rest are dropped."
 (for i in $(seq 1 10); do echo "Item $i"; done) | $VALVE --rate 1/s --max-buffer 2 --on-full drop-newest
 
+# --- Demo 6: Task Execution with --exec ---
+echo "
+--- 6. Using --exec to run a command for each line at a precise rate ---"
+echo "The valve will execute a command for each of the 3 lines, paced at 2/s."
+printf "Task A\nTask B\nTask C\n" | $VALVE --rate 2/s --exec 'echo "Executing task for: {} at $(date +%H:%M:%S)"'
+
 # --- Cleanup ---
 echo "
 --- Cleaning up dummy files ---"

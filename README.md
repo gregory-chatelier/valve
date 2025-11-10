@@ -1,4 +1,4 @@
-# `valve` — Control the data flow in pipelines
+# valve — Control the data flow in pipelines
 
 ## Overview
 
@@ -53,13 +53,11 @@ tail -f /var/log/syslog | valve --rate 5/s
 ```
 
 #### 2. Throttle API calls
-Most APIs have rate limits. Instead of adding `sleep` commands to your loops, you can precisely control the request rate and your budget.
+Most APIs have rate limits. The `--exec` flag provides a robust way to control the start time of each task, preventing burst execution.
 
 ```bash
-# Smooth, precise, non-blocking
-cat user_ids.txt | valve --rate 2/s | while read id; do
-  curl -s "https://api.example.com/users/$id"
-done
+# The --exec flag ensures each API call starts at the correct time.
+cat user_ids.txt | valve --rate 2/s --exec 'curl -s "https://api.example.com/users/{}"'
 ```
 
 #### 3. Control data transfer speed
@@ -73,17 +71,13 @@ cat database.sql | valve --rate 10MB/s --progress | psql target_db
 Evenly space 200 emails over one hour to avoid being flagged as spam. `valve` handles the timing automatically.
 
 ```bash
-cat recipients.txt | valve --rate 200/h | while read email; do
-  sendmail "$email" < template.txt
-done
+cat recipients.txt | valve --rate 200/h --exec './send_email.sh {}'
 ```
 
-You have a bunch of files to process, but you want to throttle CPU usage
+You have a bunch of files to process, but you want to throttle CPU usage. Using `--exec` ensures that processes are spawned at a steady rate.
 
 ```bash
-find /data/images -type f | valve --rate 5/s | while read img; do
-  ./compress_image "$img" &
-done
+find /data/images -type f | valve --rate 5/s --exec './compress_image "{}" &'
 ```
 
 ## Command Reference
@@ -91,6 +85,7 @@ done
 | Option | Description |
 | :--- | :--- |
 | `--rate RATE` | Flow rate (e.g. `10/s`, `200/mn`, `5MB/s`, `2GB/h`). |
+| `--exec` | Execute a command for each line of input (placeholder: `{}`). |
 | `--burst COUNT` | Number of items to allow in an initial burst. Default: `1`. |
 | `--jitter PERCENT` | Adds ±% random variation to timing (e.g., `--jitter 10`). |
 | `--progress` | Show a live progress indicator on `stderr`. |
@@ -105,6 +100,14 @@ done
 *   **`--on-full`**: Defines the backpressure strategy.
     *   `block` (default): Pauses reading from `stdin` until the buffer has space. This is the safest, lossless option.
     *   `drop-newest`: When the buffer is full, new incoming items are ignored. Good for preserving a backlog of historical data.
+
+## Alternatives
+
+`valve` is designed to be a simple, lightweight tool for rate-limiting pipelines and pace tasks. For more complex or long-standing use cases, consider these powerful, battle-tested utilities:
+
+*   **[`pv`](https://linux.die.net/man/1/pv)**: (Pipe Viewer) is an excellent tool for monitoring data progress through a pipeline, similar to `valve --progress`. It accepts rate limits and can run in line mode too.
+*   **[`GNU Parallel`](https://www.gnu.org/software/parallel/)**: A versatile and powerful tool for executing jobs in parallel. It offers sophisticated job control (with CPU cores control) that go beyond `valve --exec`. 
+*   **[`xargs`](https://man7.org/linux/man-pages/man1/xargs.1.html)**: A standard utility for building and executing commands from `stdin`. While it can run jobs in parallel (`-P`), its rate-limiting capabilities are less granular than `valve`'s.
 
 ## License
 

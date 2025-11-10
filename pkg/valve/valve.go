@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os/exec"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,19 +35,26 @@ const (
 	jitterPercentageDivisor     = 100.0
 )
 
+// Options holds the configuration for a new Valve.
+type Options struct {
+	Rate           float64
+	Burst          int
+	Jitter         int
+	ShowProgress   bool
+	MaxBufferSize  int
+	Strategy       Strategy
+	IsBytes        bool
+	ExecCmd        string
+	Reader         io.Reader
+	Writer         io.Writer
+	ProgressWriter io.Writer
+}
+
 // Valve controls the rate of data flow.
 type Valve struct {
-	limiter        *rate.Limiter
-	burst          int
-	jitter         time.Duration
-	progress       bool
-	maxBuffer      int
-	onFull         Strategy // Unexported
-	isBytes        bool
-	rate           float64
-	reader         io.Reader
-	writer         io.Writer
-	progressWriter io.Writer
+	opts    Options
+	limiter *rate.Limiter
+	jitter  time.Duration
 
 	buffer chan []byte
 	sem    chan struct{} // Semaphore to control access to the buffer's capacity
@@ -57,110 +67,167 @@ type Valve struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	errCh  chan error // Channel to expose errors
+	errCh  chan error
 }
 
-// SetProgressWriter sets the writer for progress output.
-func (v *Valve) SetProgressWriter(w io.Writer) {
-	v.progressWriter = w
-}
-
-// New creates a new Valve and starts its internal goroutines.
-func New(parentCtx context.Context, rateVal float64, burst int, jitterPercent int, progress bool, maxBuffer int, onFull Strategy, isBytes bool, reader io.Reader, writer io.Writer) *Valve {
+// New creates a new Valve.
+func New(parentCtx context.Context, opts Options) (*Valve, error) {
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	var limiterCapacity int
-	if isBytes {
-		adaptiveBatchSize := int(rateVal / adaptiveBatchTargetInterval)
+	if opts.IsBytes {
+		adaptiveBatchSize := int(opts.Rate / adaptiveBatchTargetInterval)
 		if adaptiveBatchSize < defaultChunkSize {
 			adaptiveBatchSize = defaultChunkSize
 		}
 		const assumedChunkSize = defaultChunkSize
 		limiterCapacity = adaptiveBatchSize + assumedChunkSize
 	} else {
-		limiterCapacity = burst
+		limiterCapacity = opts.Burst
 	}
 
-	limiter := rate.NewLimiter(rate.Limit(rateVal), limiterCapacity)
+	limiter := rate.NewLimiter(rate.Limit(opts.Rate), limiterCapacity)
 
 	// When a dropping strategy is used, or if the user wants no initial burst,
 	// we must consume the initial tokens from the bucket.
-	if onFull == DropNewest || burst <= 1 {
-		limiter.WaitN(ctx, limiterCapacity)
+	if opts.Strategy == DropNewest || opts.Burst <= 1 {
+		if err := limiter.WaitN(ctx, limiterCapacity); err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
 	// The semaphore is filled with tokens representing the buffer capacity.
-	sem := make(chan struct{}, maxBuffer)
-	for i := 0; i < maxBuffer; i++ {
+	sem := make(chan struct{}, opts.MaxBufferSize)
+	for i := 0; i < opts.MaxBufferSize; i++ {
 		sem <- struct{}{}
 	}
 
 	v := &Valve{
+		opts:      opts,
 		limiter:   limiter,
-		burst:     burst,
 		jitter:    time.Duration(0),
-		progress:  progress,
-		maxBuffer: maxBuffer,
-		onFull:    onFull,
-		isBytes:   isBytes,
-		rate:      rateVal,
-		reader:    reader,
-		writer:    writer,
-		buffer:    make(chan []byte, maxBuffer),
+		buffer:    make(chan []byte, opts.MaxBufferSize),
 		sem:       sem,
 		startTime: time.Now(),
 		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		ctx:       ctx,
 		cancel:    cancel,
-		errCh:     make(chan error, 1),
+		errCh:     make(chan error, 2), // Increased buffer to avoid blocking
 	}
-	if jitterPercent > 0 && v.rate > 0 {
-		delayPerUnit := float64(time.Second) / v.rate
-		v.jitter = time.Duration(delayPerUnit * (float64(jitterPercent) / jitterPercentageDivisor))
+	if opts.Jitter > 0 && opts.Rate > 0 {
+		delayPerUnit := float64(time.Second) / opts.Rate
+		v.jitter = time.Duration(delayPerUnit * (float64(opts.Jitter) / jitterPercentageDivisor))
 	}
 
-	return v
+	return v, nil
 }
 
-// Read fills the buffer from the reader.
-func (v *Valve) Read() {
+// Run starts the valve's operation. It's a blocking call.
+func (v *Valve) Run() error {
+	if v.opts.ExecCmd != "" {
+		return v.runExec()
+	}
+	return v.runPipe()
+}
+
+// runPipe runs the standard stdin -> buffer -> stdout pipeline.
+func (v *Valve) runPipe() error {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		v.read()
+	}()
+
+	go func() {
+		defer wg.Done()
+		v.write()
+	}()
+
+	wg.Wait()
+	close(v.errCh)
+
+	// Return the first error encountered, if any.
+	for err := range v.errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runExec runs the command execution pipeline.
+func (v *Valve) runExec() error {
+	scanner := bufio.NewScanner(v.opts.Reader)
+	for scanner.Scan() {
+		if err := v.limiter.Wait(v.ctx); err != nil {
+			return err
+		}
+
+		line := scanner.Text()
+		cmdStr := strings.ReplaceAll(v.opts.ExecCmd, "{}", line)
+
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("powershell.exe", "-Command", cmdStr)
+		} else {
+			cmd = exec.Command("sh", "-c", cmdStr)
+		}
+
+		cmd.Stdout = v.opts.Writer
+		cmd.Stderr = v.opts.ProgressWriter // Often stderr is used for progress/errors
+
+		if err := cmd.Run(); err != nil {
+			// Log the error but don't stop processing other lines
+			fmt.Fprintf(v.opts.ProgressWriter, "command failed for line '%s': %v\n", line, err)
+		}
+		v.updateProgress(len(line) + 1)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// read fills the buffer from the reader.
+func (v *Valve) read() {
 	defer close(v.buffer)
 
-	if v.isBytes {
+	if v.opts.IsBytes {
 		for {
 			select {
 			case <-v.ctx.Done():
 				return
 			default:
-				// Continue reading
 			}
 			buf := bytePool.Get().([]byte)
-			n, err := v.reader.Read(buf)
+			n, err := v.opts.Reader.Read(buf)
+			if n > 0 {
+				dataCopy := make([]byte, n)
+				copy(dataCopy, buf[:n])
+				v.sendToBuffer(dataCopy)
+			}
+			bytePool.Put(buf)
 			if err != nil {
-				if err == io.EOF {
-					bytePool.Put(buf)
-					break
+				if err != io.EOF {
+					v.errCh <- err
 				}
-				bytePool.Put(buf)
-				v.errCh <- err // Send error to channel
 				return
 			}
-			dataCopy := make([]byte, n)
-			copy(dataCopy, buf[:n])
-			v.sendToBuffer(dataCopy)
-			bytePool.Put(buf)
 		}
 	} else {
-		scanner := bufio.NewScanner(v.reader)
+		scanner := bufio.NewScanner(v.opts.Reader)
 		for scanner.Scan() {
 			select {
 			case <-v.ctx.Done():
 				return
 			default:
-				// Continue reading
 			}
 			data := scanner.Bytes()
 			dataCopy := make([]byte, len(data)+1) // +1 for newline
@@ -169,14 +236,14 @@ func (v *Valve) Read() {
 			v.sendToBuffer(dataCopy)
 		}
 		if err := scanner.Err(); err != nil {
-			v.errCh <- err // Send scanner error to channel
+			v.errCh <- err
 		}
 	}
 }
 
 // sendToBuffer acquires a semaphore token before adding data to the buffer.
 func (v *Valve) sendToBuffer(data []byte) {
-	switch v.onFull {
+	switch v.opts.Strategy {
 	case Block:
 		<-v.sem
 		v.buffer <- data
@@ -190,8 +257,8 @@ func (v *Valve) sendToBuffer(data []byte) {
 	}
 }
 
-// Write drains the buffer and writes to the final writer.
-func (v *Valve) Write() {
+// write drains the buffer and writes to the final writer.
+func (v *Valve) write() {
 	for {
 		select {
 		case <-v.ctx.Done():
@@ -200,66 +267,48 @@ func (v *Valve) Write() {
 			if !ok {
 				return // Channel closed
 			}
-			// Rate limit first.
 			n := 1
-			if v.isBytes {
+			if v.opts.IsBytes {
 				n = len(data)
 			}
-			reservation := v.limiter.ReserveN(time.Now(), n)
-			delay := reservation.Delay()
-
-			if v.jitter > 0 {
-				randomJitter := time.Duration(v.rng.Int63n(int64(v.jitter*2))) - v.jitter // Random value between -v.jitter and +v.jitter
-				delay += randomJitter
-				if delay < 0 {
-					delay = 0
-				}
-			}
-
-			if delay > 0 {
-				time.Sleep(delay)
-			}
-
-			// Now write.
-			_, err := v.writer.Write(data)
-			if err != nil {
-				v.errCh <- err // Send error to channel
+			if err := v.limiter.WaitN(v.ctx, n); err != nil {
+				v.errCh <- err
 				return
 			}
 
-			// Only after the write is complete, release the semaphore token.
+			_, err := v.opts.Writer.Write(data)
+			if err != nil {
+				v.errCh <- err
+				return
+			}
+
 			v.sem <- struct{}{}
 
-			// Update progress stats.
-			v.itemsProcessed++
-			v.bytesProcessed += int64(len(data))
-			if v.progress && v.progressWriter != nil {
-				elapsed := time.Since(v.startTime).Seconds()
-				if elapsed > 0 {
-					var progressInfo string
-					bytesPerSecond := float64(v.bytesProcessed) / elapsed
-					if v.isBytes {
-						progressInfo = fmt.Sprintf("\rTransferred: %s, Rate: %s/s", formatBytes(float64(v.bytesProcessed)), formatBytes(bytesPerSecond))
-					} else {
-						linesPerSecond := float64(v.itemsProcessed) / elapsed
-						progressInfo = fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
-					}
-					v.progressWriter.Write([]byte(progressInfo))
-				}
-			}
+			v.updateProgress(len(data))
 		}
 	}
-} // Buffer is a convenience method for direct channel access in tests.
-func (v *Valve) Buffer() chan []byte {
-	return v.buffer
+}
+
+func (v *Valve) updateProgress(bytesWritten int) {
+	v.itemsProcessed++
+	v.bytesProcessed += int64(bytesWritten)
+	if v.opts.ShowProgress && v.opts.ProgressWriter != nil {
+		elapsed := time.Since(v.startTime).Seconds()
+		if elapsed > 0 {
+			var progressInfo string
+			bytesPerSecond := float64(v.bytesProcessed) / elapsed
+			if v.opts.IsBytes {
+				progressInfo = fmt.Sprintf("\rTransferred: %s, Rate: %s/s", formatBytes(float64(v.bytesProcessed)), formatBytes(bytesPerSecond))
+			} else {
+				linesPerSecond := float64(v.itemsProcessed) / elapsed
+				progressInfo = fmt.Sprintf("\rProcessed Lines: %d, Rate: %.2f lines/s, Data Rate: %s/s", v.itemsProcessed, linesPerSecond, formatBytes(bytesPerSecond))
+			}
+			v.opts.ProgressWriter.Write([]byte(progressInfo))
+		}
+	}
 }
 
 // Close cancels the internal context, signaling all goroutines to shut down.
 func (v *Valve) Close() {
 	v.cancel()
-}
-
-// Err returns the error channel for the Valve.
-func (v *Valve) Err() <-chan error {
-	return v.errCh
 }

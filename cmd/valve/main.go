@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 
 	"github.com/gregory-chatelier/valve/pkg/valve"
 	"github.com/spf13/pflag"
@@ -17,6 +16,7 @@ var (
 	progress    bool
 	maxBuffer   string
 	onFull      string
+	execCmd     string
 	showVersion bool
 	version     = "dev" // Default version, overridden by ldflags
 )
@@ -30,6 +30,7 @@ func init() {
 	pflag.BoolVarP(&progress, "progress", "p", false, "Show progress bar and live rate")
 	pflag.StringVar(&maxBuffer, "max-buffer", "128KB", "Maximum internal buffer size (e.g., 64KB, 128KB, 512KB)")
 	pflag.StringVar(&onFull, "on-full", "block", "On buffer full: block, drop-newest")
+	pflag.StringVar(&execCmd, "exec", "", "Execute a command for each line of input (placeholder: {})")
 	pflag.BoolVar(&showVersion, "version", false, "Show version info")
 }
 
@@ -53,6 +54,11 @@ func main() {
 		exitFunc(1)
 	}
 
+	if execCmd != "" && isBytes {
+		fmt.Println("Error: --exec flag can only be used with line-based rates (e.g., 10/s), not byte-based rates (e.g., 5MB/s)")
+		exitFunc(1)
+	}
+
 	var bufferSize int
 	bufferSize, err = valve.ParseByteSize(maxBuffer)
 	if err != nil {
@@ -66,33 +72,29 @@ func main() {
 		exitFunc(1)
 	}
 
-	v := valve.New(context.Background(), rate, burst, jitter, progress, bufferSize, strategy, isBytes, os.Stdin, os.Stdout)
-	defer v.Close() // Ensure context is cancelled and goroutines are cleaned up
-
-	if progress {
-		v.SetProgressWriter(os.Stderr)
+	opts := valve.Options{
+		Rate:           rate,
+		Burst:          burst,
+		Jitter:         jitter,
+		ShowProgress:   progress,
+		MaxBufferSize:  bufferSize,
+		Strategy:       strategy,
+		IsBytes:        isBytes,
+		ExecCmd:        execCmd,
+		Reader:         os.Stdin,
+		Writer:         os.Stdout,
+		ProgressWriter: os.Stderr,
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	v, err := valve.New(context.Background(), opts)
+	if err != nil {
+		fmt.Printf("Error creating valve: %v\n", err)
+		exitFunc(1)
+	}
+	defer v.Close()
 
-	go func() {
-		defer wg.Done()
-		v.Read()
-	}()
-
-	go func() {
-		defer wg.Done()
-		v.Write()
-	}()
-
-	// Goroutine to listen for errors from the Valve
-	go func() {
-		for err := range v.Err() {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			exitFunc(1)
-		}
-	}()
-
-	wg.Wait()
+	if err := v.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		exitFunc(1)
+	}
 }
