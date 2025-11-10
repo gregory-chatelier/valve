@@ -7,12 +7,13 @@ import (
 	"strings"
 )
 
-// parseByteSize converts a string like "1MB", "512KB", "1.5GB" into bytes
+// ParseByteSize converts a string like "1MB", "512KB", "1.5GB" into bytes.
+// Unit-less numbers are interpreted as bytes.
 func ParseByteSize(size string) (int, error) {
-	re := regexp.MustCompile(`(?i)^(\d*\.?\d+)\s*(B|K|KB|M|MB|G|GB)$`)
+	re := regexp.MustCompile(`(?i)^(\d*\.?\d+)\s*(B|K|KB|M|MB|G|GB)?$`)
 	matches := re.FindStringSubmatch(strings.TrimSpace(size))
 	if matches == nil {
-		return 0, fmt.Errorf("invalid size format: %s (expected format: number followed by B, K, KB, M, MB, G, or GB)", size)
+		return 0, fmt.Errorf("invalid size format: %s (expected format: number, optionally followed by B, K, KB, M, MB, G, or GB)", size)
 	}
 
 	value, err := strconv.ParseFloat(matches[1], 64)
@@ -29,8 +30,9 @@ func ParseByteSize(size string) (int, error) {
 	)
 
 	var bytes float64
-	switch strings.ToUpper(matches[2]) {
-	case "B":
+	unit := strings.ToUpper(matches[2])
+	switch unit {
+	case "B", "": // Treat no unit as bytes
 		bytes = value
 	case "K", "KB":
 		bytes = value * KB

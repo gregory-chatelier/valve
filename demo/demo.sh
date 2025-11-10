@@ -46,7 +46,7 @@ echo "
 --- 5. Demonstrating 'drop-newest' buffering strategy ---"
 echo "Quickly feeding 10 items into a valve with a buffer size of 2, at a slow output rate of 1/s."
 echo "Only the first 2 items should get through; the rest are dropped."
-(for i in $(seq 1 10); do echo "Item $i"; done) | $VALVE --rate 1/s --max-buffer 2 --on-full drop-newest
+(for i in $(seq 1 10); do echo "Item $i"; done) | $VALVE --rate 1/s --max-buffer 4KB --on-full drop-newest
 
 # --- Demo 6: Task Execution with --exec ---
 echo "

@@ -56,8 +56,9 @@ type Valve struct {
 	limiter *rate.Limiter
 	jitter  time.Duration
 
-	buffer chan []byte
-	sem    chan struct{} // Semaphore to control access to the buffer's capacity
+	buffer             chan []byte
+	bufferCond         *sync.Cond
+	currentBufferBytes int64
 
 	// Internal state for progress calculation
 	itemsProcessed int64
@@ -91,8 +92,6 @@ func New(parentCtx context.Context, opts Options) (*Valve, error) {
 
 	limiter := rate.NewLimiter(rate.Limit(opts.Rate), limiterCapacity)
 
-	// When a dropping strategy is used, or if the user wants no initial burst,
-	// we must consume the initial tokens from the bucket.
 	if opts.Strategy == DropNewest || opts.Burst <= 1 {
 		if err := limiter.WaitN(ctx, limiterCapacity); err != nil {
 			cancel()
@@ -100,23 +99,18 @@ func New(parentCtx context.Context, opts Options) (*Valve, error) {
 		}
 	}
 
-	// The semaphore is filled with tokens representing the buffer capacity.
-	sem := make(chan struct{}, opts.MaxBufferSize)
-	for i := 0; i < opts.MaxBufferSize; i++ {
-		sem <- struct{}{}
-	}
-
+	const itemBufferCapacity = 1000 // Generous buffer for items, byte limit is the main constraint.
 	v := &Valve{
-		opts:      opts,
-		limiter:   limiter,
-		jitter:    time.Duration(0),
-		buffer:    make(chan []byte, opts.MaxBufferSize),
-		sem:       sem,
-		startTime: time.Now(),
-		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
-		ctx:       ctx,
-		cancel:    cancel,
-		errCh:     make(chan error, 2), // Increased buffer to avoid blocking
+		opts:       opts,
+		limiter:    limiter,
+		jitter:     time.Duration(0),
+		buffer:     make(chan []byte, itemBufferCapacity),
+		bufferCond: sync.NewCond(&sync.Mutex{}),
+		startTime:  time.Now(),
+		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		ctx:        ctx,
+		cancel:     cancel,
+		errCh:      make(chan error, 2),
 	}
 	if opts.Jitter > 0 && opts.Rate > 0 {
 		delayPerUnit := float64(time.Second) / opts.Rate
@@ -152,7 +146,6 @@ func (v *Valve) runPipe() error {
 	wg.Wait()
 	close(v.errCh)
 
-	// Return the first error encountered, if any.
 	for err := range v.errCh {
 		if err != nil {
 			return err
@@ -180,10 +173,9 @@ func (v *Valve) runExec() error {
 		}
 
 		cmd.Stdout = v.opts.Writer
-		cmd.Stderr = v.opts.ProgressWriter // Often stderr is used for progress/errors
+		cmd.Stderr = v.opts.ProgressWriter
 
 		if err := cmd.Run(); err != nil {
-			// Log the error but don't stop processing other lines
 			fmt.Fprintf(v.opts.ProgressWriter, "command failed for line '%s': %v\n", line, err)
 		}
 		v.updateProgress(len(line) + 1)
@@ -241,19 +233,28 @@ func (v *Valve) read() {
 	}
 }
 
-// sendToBuffer acquires a semaphore token before adding data to the buffer.
+// sendToBuffer manages the byte-based buffer limit before sending data to the channel.
 func (v *Valve) sendToBuffer(data []byte) {
-	switch v.opts.Strategy {
-	case Block:
-		<-v.sem
-		v.buffer <- data
-	case DropNewest:
-		select {
-		case <-v.sem:
-			v.buffer <- data
-		default:
-			// Drop
+	v.bufferCond.L.Lock()
+	for v.currentBufferBytes+int64(len(data)) > int64(v.opts.MaxBufferSize) && v.ctx.Err() == nil {
+		if v.opts.Strategy == DropNewest {
+			v.bufferCond.L.Unlock()
+			return // Drop the data
 		}
+		v.bufferCond.Wait() // Block
+	}
+
+	if v.ctx.Err() != nil {
+		v.bufferCond.L.Unlock()
+		return
+	}
+
+	v.currentBufferBytes += int64(len(data))
+	v.bufferCond.L.Unlock()
+
+	select {
+	case v.buffer <- data:
+	case <-v.ctx.Done():
 	}
 }
 
@@ -267,6 +268,14 @@ func (v *Valve) write() {
 			if !ok {
 				return // Channel closed
 			}
+
+			// Announce that space is now available in the buffer
+			v.bufferCond.L.Lock()
+			v.currentBufferBytes -= int64(len(data))
+			v.bufferCond.Signal()
+			v.bufferCond.L.Unlock()
+
+			// Rate limit
 			n := 1
 			if v.opts.IsBytes {
 				n = len(data)
@@ -276,13 +285,12 @@ func (v *Valve) write() {
 				return
 			}
 
+			// Write
 			_, err := v.opts.Writer.Write(data)
 			if err != nil {
 				v.errCh <- err
 				return
 			}
-
-			v.sem <- struct{}{}
 
 			v.updateProgress(len(data))
 		}
@@ -306,6 +314,11 @@ func (v *Valve) updateProgress(bytesWritten int) {
 			v.opts.ProgressWriter.Write([]byte(progressInfo))
 		}
 	}
+}
+
+// Writer returns the underlying writer for the valve.
+func (v *Valve) Writer() io.Writer {
+	return v.opts.Writer
 }
 
 // Close cancels the internal context, signaling all goroutines to shut down.

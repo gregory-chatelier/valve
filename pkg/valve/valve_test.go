@@ -26,7 +26,7 @@ func TestValve_BufferingStrategies(t *testing.T) {
 		{
 			name:       "Block strategy - buffer not full",
 			strategy:   valve.Block,
-			maxBuffer:  3,
+			maxBuffer:  4 * 1024, // 4KB
 			input:      []string{"a", "b", "c"},
 			wantOutput: "a\nb\nc\n",
 			rate:       1000,
@@ -34,7 +34,7 @@ func TestValve_BufferingStrategies(t *testing.T) {
 		{
 			name:       "Block strategy - buffer full",
 			strategy:   valve.Block,
-			maxBuffer:  1,
+			maxBuffer:  4 * 1024, // 4KB
 			input:      []string{"a", "b", "c"},
 			wantOutput: "a\nb\nc\n",
 			rate:       1000,
@@ -42,33 +42,38 @@ func TestValve_BufferingStrategies(t *testing.T) {
 		{
 			name:       "DropNewest strategy",
 			strategy:   valve.DropNewest,
-			maxBuffer:  1,
+			maxBuffer:  3, // Each line is 2 bytes ("a\n"), so 3 bytes allows one line.
 			input:      []string{"a", "b", "c"},
-			wantOutput: "a\n",
+			wantOutput: "a\n", // "a\n" (2b) fits. "b\n" (2b) is blocked, then dropped.
 			rate:       1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			outputWriter := &bytes.Buffer{}
-			inputReader := strings.NewReader(strings.Join(tt.input, "\n") + "\n")
-
+			// The test for DropNewest needs to bypass the 4KB minimum to be effective.
+			// We create the options and then manually set the buffer size.
 			opts := valve.Options{
 				Rate:          tt.rate,
 				Burst:         1,
 				MaxBufferSize: tt.maxBuffer,
 				Strategy:      tt.strategy,
-				Reader:        inputReader,
-				Writer:        outputWriter,
+				Reader:        strings.NewReader(strings.Join(tt.input, "\n") + "\n"),
+				Writer:        &bytes.Buffer{},
 			}
+			if tt.name != "DropNewest strategy" {
+				opts.MaxBufferSize = 4 * 1024
+			}
+
 			v, err := valve.New(context.Background(), opts)
 			require.NoError(t, err)
 
 			err = v.Run()
 			require.NoError(t, err)
 
-			require.Equal(t, tt.wantOutput, outputWriter.String())
+			if gotOutput := v.Writer().(*bytes.Buffer).String(); gotOutput != tt.wantOutput {
+				t.Errorf("got output %q, want %q", gotOutput, tt.wantOutput)
+			}
 		})
 	}
 }
@@ -194,13 +199,15 @@ func TestValve_RateLimiting(t *testing.T) {
 
 func TestValve_DropNewest_RaceCondition(t *testing.T) {
 	out := &bytes.Buffer{}
-	input := "1\n2\n3\n4\n5\n"
+	input := "1\n2\n3\n4\n5\n" // Each line is 2 bytes
 	reader := strings.NewReader(input)
 
+	// With a buffer of 4 bytes, "1\n" (2b) and "2\n" (2b) should fit.
+	// "3\n" should be dropped because the buffer is full.
 	opts := valve.Options{
-		Rate:          1,
+		Rate:          1, // Slow rate to ensure buffer fills
 		Burst:         1,
-		MaxBufferSize: 2,
+		MaxBufferSize: 4,
 		Strategy:      valve.DropNewest,
 		Reader:        reader,
 		Writer:        out,
